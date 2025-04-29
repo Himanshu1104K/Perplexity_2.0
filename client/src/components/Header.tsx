@@ -1,4 +1,6 @@
-const Header = () => {
+import React from 'react';
+
+const Header: React.FC = () => {
     return (
         <header className="relative flex items-center justify-between px-8 py-5 bg-gradient-to-r from-[#4A3F71] to-[#5E507F] z-10">
             <div className="absolute inset-0 bg-[url('/api/placeholder/100/100')] opacity-5 mix-blend-overlay"></div>

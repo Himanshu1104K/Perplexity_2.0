@@ -1,5 +1,21 @@
 import React from 'react';
 
+interface SearchInfo {
+    stages: string[];
+    query: string;
+    urls: string[] | any;
+    error?: string;
+}
+
+interface Message {
+    id: number;
+    content: string;
+    isUser: boolean;
+    type: string;
+    isLoading?: boolean;
+    searchInfo?: SearchInfo;
+}
+
 const PremiumTypingAnimation = () => {
     return (
         <div className="flex items-center">
@@ -15,7 +31,11 @@ const PremiumTypingAnimation = () => {
     );
 };
 
-const SearchStages = ({ searchInfo }) => {
+interface SearchStagesProps {
+    searchInfo: SearchInfo;
+}
+
+const SearchStages = ({ searchInfo }: SearchStagesProps) => {
     if (!searchInfo || !searchInfo.stages || searchInfo.stages.length === 0) return null;
 
     return (
@@ -105,7 +125,11 @@ const SearchStages = ({ searchInfo }) => {
     );
 };
 
-const MessageArea = ({ messages }) => {
+interface MessageAreaProps {
+    messages: Message[];
+}
+
+const MessageArea = ({ messages }: MessageAreaProps) => {
     return (
         <div className="flex-grow overflow-y-auto bg-[#FCFCF8] border-b border-gray-100" style={{ minHeight: 0 }}>
             <div className="max-w-4xl mx-auto p-6">
