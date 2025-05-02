@@ -18,6 +18,7 @@ interface Message {
   type: string;
   isLoading?: boolean;
   searchInfo?: SearchInfo;
+  imageUrl?: string;
 }
 
 const Home = () => {
@@ -30,7 +31,7 @@ const Home = () => {
     },
   ]);
   const [currentMessage, setCurrentMessage] = useState("");
-  const [checkpointId, setCheckpointId] = useState<string | null>(null);
+  const [conversationId, setConversationId] = useState<string | null>(null);
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -73,12 +74,18 @@ const Home = () => {
           },
         ]);
 
-        // Create URL with checkpoint ID if it exists
-        let url = `https://perplexity-2-0.onrender.com/rag_chat/${encodeURIComponent(
-          userInput
-        )}`;
-        if (checkpointId) {
-          url += `?checkpoint_id=${encodeURIComponent(checkpointId)}`;
+        // Create URL with conversation ID if it exists
+        let url;
+        if (conversationId) {
+          // Use the continue endpoint when we have a conversation ID
+          url = `http://localhost:8000/rag_chat/continue/${encodeURIComponent(
+            conversationId
+          )}/${encodeURIComponent(userInput)}`;
+        } else {
+          // Start a new conversation
+          url = `http://localhost:8000/rag_chat/${encodeURIComponent(
+            userInput
+          )}`;
         }
 
         // Connect to SSE endpoint using EventSource
@@ -86,30 +93,42 @@ const Home = () => {
         let streamedContent = "";
         let searchData: SearchInfo | null = null;
         let hasReceivedContent = false;
+        let imageUrl: string | undefined = undefined;
 
         // Process incoming messages
         eventSource.onmessage = (event) => {
           try {
             const data: any = JSON.parse(event.data);
+            console.log("Received event:", data);
 
-            if (data.type === "checkpoint") {
-              // Store the checkpoint ID for future requests
-              setCheckpointId(data.checkpoint_id);
+            if (data.type === "conversation_start") {
+              // Store the conversation ID for future requests
+              setConversationId(data.conversation_id);
+              console.log(
+                "New conversation started with ID:",
+                data.conversation_id
+              );
             } else if (data.type === "content") {
               // Filter out all metadata and tool decision information
               let cleanContent = data.content;
-              
+
               // Remove tool decision JSON-like patterns
-              cleanContent = cleanContent.replace(/\{[\s]*use_(?:rag|search|image_gen)[\s\w,.:'"{}]*\}/g, "");
-              
+              cleanContent = cleanContent.replace(
+                /\{[\s]*use_(?:rag|search|image_gen)[\s\w,.:'"{}]*\}/g,
+                ""
+              );
+
               // Remove any other JSON-like metadata at the beginning
               cleanContent = cleanContent.replace(/^\s*\{[^}]*\}\s*/g, "");
-              
+
               // Clean up any "waiting for response" text if we're getting actual content
-              if (cleanContent.trim() && streamedContent.includes("Waiting for response")) {
+              if (
+                cleanContent.trim() &&
+                streamedContent.includes("Waiting for response")
+              ) {
                 streamedContent = "";
               }
-              
+
               streamedContent += cleanContent;
               hasReceivedContent = true;
 
@@ -177,6 +196,54 @@ const Home = () => {
               } catch (err) {
                 console.error("Error parsing search results:", err);
               }
+            } else if (data.type === "image_gen_start") {
+              // Handle image generation start
+              const newSearchInfo = {
+                stages: searchData
+                  ? [...searchData.stages, "generating image"]
+                  : ["generating image"],
+                query: data.query,
+                urls: searchData?.urls || [],
+              };
+              searchData = newSearchInfo;
+
+              setMessages((prev) =>
+                prev.map((msg) =>
+                  msg.id === aiResponseId
+                    ? {
+                        ...msg,
+                        content: streamedContent,
+                        searchInfo: newSearchInfo,
+                        isLoading: false,
+                      }
+                    : msg
+                )
+              );
+            } else if (data.type === "image_generated") {
+              // Handle image generation completion
+              imageUrl = data.url;
+              const newSearchInfo = {
+                stages: searchData
+                  ? [...searchData.stages, "image created"]
+                  : ["image created"],
+                query: searchData?.query || "",
+                urls: searchData?.urls || [],
+              };
+              searchData = newSearchInfo;
+
+              setMessages((prev) =>
+                prev.map((msg) =>
+                  msg.id === aiResponseId
+                    ? {
+                        ...msg,
+                        content: streamedContent,
+                        searchInfo: newSearchInfo,
+                        isLoading: false,
+                        imageUrl: imageUrl,
+                      }
+                    : msg
+                )
+              );
             } else if (data.type === "search_error") {
               // Handle search error
               const newSearchInfo = {
@@ -201,6 +268,25 @@ const Home = () => {
                     : msg
                 )
               );
+            } else if (data.type === "response_complete") {
+              // Handle response completion with possible image
+              if (data.has_image && data.image_url) {
+                imageUrl = data.image_url;
+
+                // Update message with image URL
+                setMessages((prev) =>
+                  prev.map((msg) =>
+                    msg.id === aiResponseId
+                      ? {
+                          ...msg,
+                          content: streamedContent,
+                          imageUrl: imageUrl,
+                          isLoading: false,
+                        }
+                      : msg
+                  )
+                );
+              }
             } else if (data.type === "end") {
               // When stream ends, add 'writing' stage if we had search info
               if (searchData) {
@@ -222,6 +308,7 @@ const Home = () => {
                           content: finalCleanContent,
                           searchInfo: finalSearchInfo,
                           isLoading: false,
+                          imageUrl: imageUrl,
                         }
                       : msg
                   )
@@ -231,7 +318,7 @@ const Home = () => {
                 const finalCleanContent = streamedContent
                   .replace(/^\s*\{[^}]*\}\s*/g, "") // Remove JSON-like metadata at the beginning
                   .trim();
-                
+
                 setMessages((prev) =>
                   prev.map((msg) =>
                     msg.id === aiResponseId
@@ -239,12 +326,27 @@ const Home = () => {
                           ...msg,
                           content: finalCleanContent,
                           isLoading: false,
+                          imageUrl: imageUrl,
                         }
                       : msg
                   )
                 );
               }
 
+              eventSource.close();
+            } else if (data.type === "error") {
+              // Handle explicit error messages from the server
+              setMessages((prev) =>
+                prev.map((msg) =>
+                  msg.id === aiResponseId
+                    ? {
+                        ...msg,
+                        content: `Error: ${data.message || "Unknown error"}`,
+                        isLoading: false,
+                      }
+                    : msg
+                )
+              );
               eventSource.close();
             }
           } catch (error) {
@@ -294,11 +396,24 @@ const Home = () => {
     }
   };
 
+  // Add a function to reset the conversation
+  const resetConversation = () => {
+    setConversationId(null);
+    setMessages([
+      {
+        id: 1,
+        content: "Hi there, how can I help you?",
+        isUser: false,
+        type: "message",
+      },
+    ]);
+  };
+
   return (
     <div className="flex justify-center bg-gray-100 min-h-screen py-8 px-4">
       {/* Main container with refined shadow and border */}
       <div className="w-[70%] bg-white flex flex-col rounded-xl shadow-lg border border-gray-100 overflow-hidden h-[90vh]">
-        <Header />
+        <Header onNewChat={resetConversation} />
         <MessageArea messages={messages} />
         <InputBar
           currentMessage={currentMessage}

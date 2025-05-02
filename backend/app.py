@@ -23,12 +23,15 @@ from fastapi import FastAPI, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import AIMessageChunk
+from contextlib import asynccontextmanager
 
 
 load_dotenv()
 
 # Initialize LLM
 llm = ChatOpenAI(model="gpt-3.5-turbo")
+
+vectorstore = None
 
 
 # Define a simple last-value reducer function
@@ -84,19 +87,6 @@ async def setup_qdrant_vectorstore():
     )
 
     return vectorstore
-
-
-# Initialize vectorstore
-# We need to run this in an async context
-async def init_resources():
-    global vectorstore
-    vectorstore = await setup_qdrant_vectorstore()
-
-
-# Remove the problematic code that runs at module import time
-# and causes "Cannot run the event loop while another loop is running" error
-# Instead, initialize vectorstore as None and set it up during app startup
-vectorstore = None
 
 
 # Store conversation in vector database
@@ -169,14 +159,6 @@ async def retrieve_from_rag(state: EnhancedRAGState) -> EnhancedRAGState:
     docs = await vectorstore.asimilarity_search(
         state["query"],
         k=5,
-        filter=models.Filter(
-            should=[
-                models.FieldCondition(
-                    key="conversation_id",
-                    match=models.MatchValue(value=state["conversation_id"]),
-                )
-            ]
-        ),
     )
 
     # Combine retrieved documents into context
@@ -197,7 +179,6 @@ def generate_dalle_image(prompt: str) -> str:
             n=1,
             size="512x512",
         )
-        print(response.data[0].url)
         return response.data[0].url
     except Exception as e:
         return f"Error generating image: {str(e)}"
@@ -315,7 +296,6 @@ async def generate_response(state: EnhancedRAGState) -> EnhancedRAGState:
     prompt = ChatPromptTemplate.from_messages(messages)
     chain = prompt | llm | StrOutputParser()
     response = await chain.ainvoke({})
-    print(f"Generated response: {response[:100]}...")
     if state["image_url"]:
         state["response"] = f"{response} : {state['image_url']}"
     else:
@@ -357,8 +337,15 @@ def build_enhanced_graph():
 enhanced_graph = build_enhanced_graph()
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global vectorstore
+    vectorstore = await setup_qdrant_vectorstore()
+    yield
+
+
 # Create FastAPI app
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -368,17 +355,6 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["Content-Type"],
 )
-
-
-# Add startup event to initialize resources properly
-@app.on_event("startup")
-async def startup_event():
-    """Initialize resources during app startup"""
-    global vectorstore
-    if vectorstore is None:
-        print("Initializing vectorstore...")
-        vectorstore = await setup_qdrant_vectorstore()
-        print("Vectorstore initialized successfully")
 
 
 def serialize_ai_message_chunk(chunk):
@@ -393,11 +369,65 @@ def serialize_ai_message_chunk(chunk):
 async def generate_enhanced_response(query: str, conversation_id: Optional[str] = None):
     """Generate response using the enhanced RAG system with streaming"""
     is_new_conversation = conversation_id is None
+
+    # Fetch previous messages if this is an existing conversation
+    previous_messages = []
+    if not is_new_conversation:
+        # Try to load messages from recent documents first
+        try:
+            # Get previous messages from the vector store for this conversation
+            docs = await vectorstore.asimilarity_search(
+                "",  # Empty query to get all messages
+                k=20,  # Increased to get more history
+                filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="conversation_id",
+                            match=models.MatchValue(value=conversation_id),
+                        )
+                    ]
+                ),
+            )
+
+            if docs:
+                # Sort documents by timestamp to get them in order
+                docs.sort(
+                    key=lambda doc: doc.metadata.get("timestamp", ""), reverse=False
+                )
+
+                for doc in docs:
+                    content = doc.page_content
+                    if "User:" in content:
+                        user_msg_parts = content.split("User:")
+                        for i, part in enumerate(user_msg_parts):
+                            if i == 0:  # Skip the first part before "User:"
+                                continue
+
+                            # Extract user message
+                            if "Assistant:" in part:
+                                user_text = part.split("Assistant:")[0].strip()
+                                assistant_text = part.split("Assistant:")[1].strip()
+                            else:
+                                user_text = part.strip()
+                                assistant_text = None
+
+                            if user_text:
+                                previous_messages.append(
+                                    HumanMessage(content=user_text)
+                                )
+
+                            if assistant_text:
+                                previous_messages.append(
+                                    AIMessage(content=assistant_text)
+                                )
+        except Exception as e:
+            previous_messages = []  # Reset if there's an error
+
     if is_new_conversation:
         new_conversation_id = str(uuid.uuid4())
         config = {"configurable": {"thread_id": new_conversation_id}}
 
-        # Initialize state
+        # Initialize state with a single message
         state = {
             "conversation_id": new_conversation_id,
             "messages": [HumanMessage(content=query)],
@@ -418,10 +448,14 @@ async def generate_enhanced_response(query: str, conversation_id: Optional[str] 
     else:
         config = {"configurable": {"thread_id": conversation_id}}
 
-        # Initialize state with existing conversation ID
+        # Add the current query to previous messages
+        messages = previous_messages.copy()
+        messages.append(HumanMessage(content=query))
+
+        # Initialize state with all messages
         state = {
             "conversation_id": conversation_id,
-            "messages": [HumanMessage(content=query)],
+            "messages": messages,
             "query": query,
             "tool_decision": {
                 "use_rag": False,
@@ -443,7 +477,11 @@ async def generate_enhanced_response(query: str, conversation_id: Optional[str] 
         # Stream LLM content chunks
         if event_type == "on_chat_model_stream":
             chunk_message = serialize_ai_message_chunk(event["data"]["chunk"])
-            safe_content = chunk_message.replace("'", "\\").replace("\n", "\\n")
+            safe_content = (
+                chunk_message.replace("'", "\\")
+                .replace('"', '\\"')
+                .replace("\n", "\\n")
+            )
             yield f'data: {{"type":"content","content":"{safe_content}"}}\n\n'
 
         # Tool usage events
@@ -453,13 +491,21 @@ async def generate_enhanced_response(query: str, conversation_id: Optional[str] 
             # Handle tool decision node
             if node_name == "select_tools":
                 tool_decision = event["data"]["output"].get("tool_decision", {})
+
                 if tool_decision.get("use_search", False):
                     safe_query = (
-                        query.replace('"', "\\").replace("'", "\\").replace("\n", "\\n")
+                        query.replace('"', '\\"')
+                        .replace("'", "\\'")
+                        .replace("\n", "\\n")
                     )
                     yield f'data: {{"type":"search_start","query":"{safe_query}"}}\n\n'
 
                 if tool_decision.get("use_image_gen", False):
+                    safe_query = (
+                        query.replace('"', '\\"')
+                        .replace("'", "\\'")
+                        .replace("\n", "\\n")
+                    )
                     yield f'data: {{"type":"image_gen_start","query":"{safe_query}"}}\n\n'
 
         # Web search results
@@ -479,7 +525,21 @@ async def generate_enhanced_response(query: str, conversation_id: Optional[str] 
         elif event_type == "on_node_end" and event.get("name") == "generate_image":
             image_url = event["data"]["output"].get("image_url")
             if image_url:
-                yield f'data: {{"type":"image_generated","url":"{image_url}"}}\n\n'
+                safe_url = image_url.replace('"', '\\"').replace("'", "\\'")
+                yield f'data: {{"type":"image_generated","url":"{safe_url}"}}\n\n'
+
+        # Response completion notification
+        elif event_type == "on_node_end" and event.get("name") == "generate_response":
+            output_data = event["data"]["output"]
+            has_image = bool(output_data.get("image_url"))
+
+            if has_image:
+                safe_url = (
+                    output_data["image_url"].replace('"', '\\"').replace("'", "\\'")
+                )
+                yield f'data: {{"type":"response_complete","has_image":true,"image_url":"{safe_url}"}}\n\n'
+            else:
+                yield f'data: {{"type":"response_complete","has_image":false}}\n\n'
 
     # Store conversation
     await store_conversation(
