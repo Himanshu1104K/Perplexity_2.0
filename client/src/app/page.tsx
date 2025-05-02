@@ -74,7 +74,7 @@ const Home = () => {
         ]);
 
         // Create URL with checkpoint ID if it exists
-        let url = `http://localhost:8000/rag_chat/${encodeURIComponent(
+        let url = `https://perplexity-2-0.onrender.com/rag_chat/${encodeURIComponent(
           userInput
         )}`;
         if (checkpointId) {
