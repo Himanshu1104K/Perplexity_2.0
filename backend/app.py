@@ -93,15 +93,10 @@ async def init_resources():
     vectorstore = await setup_qdrant_vectorstore()
 
 
-# This code will be run at module import time
-if "vectorstore" not in globals():
-    import asyncio
-
-    # Create a new event loop for initialization
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(init_resources())
-    loop.close()
+# Remove the problematic code that runs at module import time
+# and causes "Cannot run the event loop while another loop is running" error
+# Instead, initialize vectorstore as None and set it up during app startup
+vectorstore = None
 
 
 # Store conversation in vector database
@@ -373,6 +368,17 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["Content-Type"],
 )
+
+
+# Add startup event to initialize resources properly
+@app.on_event("startup")
+async def startup_event():
+    """Initialize resources during app startup"""
+    global vectorstore
+    if vectorstore is None:
+        print("Initializing vectorstore...")
+        vectorstore = await setup_qdrant_vectorstore()
+        print("Vectorstore initialized successfully")
 
 
 def serialize_ai_message_chunk(chunk):
