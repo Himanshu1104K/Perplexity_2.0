@@ -1,8 +1,11 @@
 langchain
 langgraph
 langchain-community
-langchain-google-genai
 langchain_core
 python-dotenv
 fastapi
 uvicorn
+langchain_openai
+openai
+qdrant-client
+langchain_qdrant
