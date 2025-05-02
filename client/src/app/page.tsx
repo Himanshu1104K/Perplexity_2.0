@@ -74,7 +74,7 @@ const Home = () => {
         ]);
 
         // Create URL with checkpoint ID if it exists
-        let url = `https://perplexity-2-0.onrender.com/chat_stream/${encodeURIComponent(
+        let url = `http://localhost:8000/rag_chat/${encodeURIComponent(
           userInput
         )}`;
         if (checkpointId) {
@@ -90,13 +90,27 @@ const Home = () => {
         // Process incoming messages
         eventSource.onmessage = (event) => {
           try {
-            const data = JSON.parse(event.data);
+            const data: any = JSON.parse(event.data);
 
             if (data.type === "checkpoint") {
               // Store the checkpoint ID for future requests
               setCheckpointId(data.checkpoint_id);
             } else if (data.type === "content") {
-              streamedContent += data.content;
+              // Filter out all metadata and tool decision information
+              let cleanContent = data.content;
+              
+              // Remove tool decision JSON-like patterns
+              cleanContent = cleanContent.replace(/\{[\s]*use_(?:rag|search|image_gen)[\s\w,.:'"{}]*\}/g, "");
+              
+              // Remove any other JSON-like metadata at the beginning
+              cleanContent = cleanContent.replace(/^\s*\{[^}]*\}\s*/g, "");
+              
+              // Clean up any "waiting for response" text if we're getting actual content
+              if (cleanContent.trim() && streamedContent.includes("Waiting for response")) {
+                streamedContent = "";
+              }
+              
+              streamedContent += cleanContent;
               hasReceivedContent = true;
 
               // Update message with accumulated content
@@ -195,12 +209,35 @@ const Home = () => {
                   stages: [...searchData.stages, "writing"],
                 };
 
+                // Final clean-up of content to remove any leftover metadata
+                const finalCleanContent = streamedContent
+                  .replace(/^\s*\{[^}]*\}\s*/g, "") // Remove JSON-like metadata at the beginning
+                  .trim();
+
                 setMessages((prev) =>
                   prev.map((msg) =>
                     msg.id === aiResponseId
                       ? {
                           ...msg,
+                          content: finalCleanContent,
                           searchInfo: finalSearchInfo,
+                          isLoading: false,
+                        }
+                      : msg
+                  )
+                );
+              } else {
+                // If no search data, just clean the content
+                const finalCleanContent = streamedContent
+                  .replace(/^\s*\{[^}]*\}\s*/g, "") // Remove JSON-like metadata at the beginning
+                  .trim();
+                
+                setMessages((prev) =>
+                  prev.map((msg) =>
+                    msg.id === aiResponseId
+                      ? {
+                          ...msg,
+                          content: finalCleanContent,
                           isLoading: false,
                         }
                       : msg
