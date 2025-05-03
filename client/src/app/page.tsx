@@ -99,15 +99,10 @@ const Home = () => {
         eventSource.onmessage = (event) => {
           try {
             const data: any = JSON.parse(event.data);
-            console.log("Received event:", data);
 
             if (data.type === "conversation_start") {
               // Store the conversation ID for future requests
               setConversationId(data.conversation_id);
-              console.log(
-                "New conversation started with ID:",
-                data.conversation_id
-              );
             } else if (data.type === "content") {
               // Filter out all metadata and tool decision information
               let cleanContent = data.content;

@@ -1,6 +1,6 @@
 import os
 from typing import Annotated, Sequence, TypedDict, Dict, Any, Optional
-from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, AIMessage, HumanMessage
 from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from langchain_openai import ChatOpenAI
 from langchain_qdrant import QdrantVectorStore
@@ -18,6 +18,8 @@ from qdrant_client import QdrantClient, models
 from qdrant_client.models import Distance, VectorParams
 from dotenv import load_dotenv
 from langgraph.graph.message import add_messages
+from langgraph.types import Command
+
 import json
 from fastapi import FastAPI, Query
 from fastapi.responses import StreamingResponse
@@ -48,7 +50,7 @@ class EnhancedRAGState(TypedDict):
     tool_decision: Annotated[Dict[str, bool], get_last_value]
     rag_context: Annotated[str, get_last_value]
     search_results: Annotated[str, get_last_value]
-    image_url: Annotated[Optional[str], get_last_value]
+    image_url: Annotated[str, get_last_value]
     response: Annotated[str, get_last_value]
 
 
@@ -145,27 +147,53 @@ async def select_tools(state: EnhancedRAGState) -> EnhancedRAGState:
     decision = await chain.ainvoke({"query": state["query"]})
 
     state["tool_decision"] = decision
-    return state
+    if decision["use_search"]:
+        return Command(
+            goto="perform_web_search",
+            update=state,
+        )
+    elif decision["use_image_gen"]:
+        return Command(
+            goto="generate_image",
+            update=state,
+        )
+    elif decision["use_rag"]:
+        return Command(
+            goto="retrieve_from_rag",
+            update=state,
+        )
+    else:
+        return Command(
+            goto="generate_response",
+            update=state,
+        )
 
 
 # 2. RAG Retrieval Node
 async def retrieve_from_rag(state: EnhancedRAGState) -> EnhancedRAGState:
     """Retrieve relevant context from vector database if needed"""
-    if not state["tool_decision"]["use_rag"]:
-        state["rag_context"] = ""
-        return state
-
     # Retrieve documents
     docs = await vectorstore.asimilarity_search(
         state["query"],
-        k=5,
+        k=3,
+        # not adding this because some frontend code is not updated to handle this
+        # filter=models.Filter(
+        #     must=[
+        #         models.FieldCondition(
+        #             key="conversation_id",
+        #             match=models.MatchValue(value=state["conversation_id"]),
+        #         )
+        #     ]
+        # ),
     )
-
     # Combine retrieved documents into context
     context = "\n\n".join([doc.page_content for doc in docs])
     state["rag_context"] = context
 
-    return state
+    return Command(
+        goto="generate_response",
+        update=state,
+    )
 
 
 # 3. DALL-E Image Generation Tool
@@ -192,10 +220,6 @@ dalle_tool = generate_dalle_image
 # Web Search Node
 async def perform_web_search(state: EnhancedRAGState) -> EnhancedRAGState:
     """Perform web search if needed"""
-    if not state["tool_decision"]["use_search"]:
-        state["search_results"] = ""
-        return state
-
     # Execute the tavily search tool
     search_query = state["query"]
     search_results = await tavily_tool.ainvoke(search_query)
@@ -212,17 +236,18 @@ async def perform_web_search(state: EnhancedRAGState) -> EnhancedRAGState:
             formatted_results.append("")
         search_results = "\n".join(formatted_results)
 
+    search_results = search_results.replace("{", "{{").replace("}", "}}")
+
     state["search_results"] = search_results
-    return state
+    return Command(
+        goto="generate_response",
+        update=state,
+    )
 
 
 # Image Generation Node
 async def generate_image(state: EnhancedRAGState) -> EnhancedRAGState:
     """Generate an image if needed"""
-    if not state["tool_decision"]["use_image_gen"]:
-        state["image_url"] = None
-        return state
-
     # Create an improved prompt for DALL-E
     image_prompt_template = ChatPromptTemplate.from_messages(
         [
@@ -244,8 +269,12 @@ async def generate_image(state: EnhancedRAGState) -> EnhancedRAGState:
     # Execute the DALL-E tool
     image_url = await dalle_tool.ainvoke(enhanced_prompt)
 
-    state["image_url"] = image_url
-    return state
+    state["image_url"] = str(image_url)
+
+    return Command(
+        goto="generate_response",
+        update=state,
+    )
 
 
 # Response Generation Node
@@ -255,52 +284,39 @@ async def generate_response(state: EnhancedRAGState) -> EnhancedRAGState:
     messages = [
         (
             "system",
-            """
-        You are a helpful AI assistant with access to multiple tools. Respond to the user's query thoughtfully.
-        Include any relevant information from the tools that were used in your response.
-        If an image was generated, mention its contents and that it's available for viewing.
-        """,
+            "You are a helpful AI assistant. Respond directly to the user's query in a clear and concise manner. "
+            "If you have search results, use them to inform your response but don't mention the search process itself. "
+            "If an image was generated, simply describe what's in the image and mention it's available for viewing.",
         )
     ]
 
-    # Add message history for context
-    if state["messages"]:
-        messages.append(("system", "Previous conversation history:"))
-        for msg in state["messages"]:
-            if isinstance(msg, HumanMessage):
-                messages.append(("system", f"User: {msg.content}"))
-            elif isinstance(msg, AIMessage):
-                messages.append(("system", f"Assistant: {msg.content}"))
-
-    # Add context if available
-    if state["rag_context"]:
+    # Add context if available - but only if relevant
+    if state["rag_context"] and state["rag_context"] != "":
         messages.append(
-            ("system", f"Context from past conversations:\n{state['rag_context']}")
+            ("system", "Context from past conversations:\n" + state["rag_context"])
         )
 
-    if state["search_results"]:
-        search_info = f"Web search results:\n{state['search_results']}"
-        messages.append(("system", search_info))
+    if state["search_results"] and state["search_results"] != "":
+        messages.append(("system", f"Web search results:\n {state['search_results']}"))
 
-    if state["image_url"]:
+    if state["image_url"] and state["image_url"] != "":
         messages.append(
             (
                 "system",
-                f"An image was generated and is available at : {state['image_url']}",
+                "You have generated an image which is available at: "
+                + state["image_url"]
+                + ". Mention that an image has been created for the user and DO include the URL in your response.",
             )
         )
 
-    # Add the current query
+    # Add only the current query - don't include message history to avoid confusion
     messages.append(("user", state["query"]))
 
     prompt = ChatPromptTemplate.from_messages(messages)
     chain = prompt | llm | StrOutputParser()
     response = await chain.ainvoke({})
-    if state["image_url"]:
-        state["response"] = f"{response} : {state['image_url']}"
-    else:
-        state["response"] = response
 
+    state["response"] = response
     return state
 
 
@@ -314,16 +330,6 @@ def build_enhanced_graph():
     workflow.add_node("perform_web_search", perform_web_search)
     workflow.add_node("generate_image", generate_image)
     workflow.add_node("generate_response", generate_response)
-
-    # Add edges - parallel execution of tools after decision
-    workflow.add_edge("select_tools", "retrieve_from_rag")
-    workflow.add_edge("select_tools", "perform_web_search")
-    workflow.add_edge("select_tools", "generate_image")
-
-    # All tools must complete before generating response
-    workflow.add_edge("retrieve_from_rag", "generate_response")
-    workflow.add_edge("perform_web_search", "generate_response")
-    workflow.add_edge("generate_image", "generate_response")
 
     workflow.add_edge("generate_response", END)
 
@@ -370,67 +376,14 @@ async def generate_enhanced_response(query: str, conversation_id: Optional[str] 
     """Generate response using the enhanced RAG system with streaming"""
     is_new_conversation = conversation_id is None
 
-    # Fetch previous messages if this is an existing conversation
-    previous_messages = []
-    if not is_new_conversation:
-        # Try to load messages from recent documents first
-        try:
-            # Get previous messages from the vector store for this conversation
-            docs = await vectorstore.asimilarity_search(
-                "",  # Empty query to get all messages
-                k=20,  # Increased to get more history
-                filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="conversation_id",
-                            match=models.MatchValue(value=conversation_id),
-                        )
-                    ]
-                ),
-            )
-
-            if docs:
-                # Sort documents by timestamp to get them in order
-                docs.sort(
-                    key=lambda doc: doc.metadata.get("timestamp", ""), reverse=False
-                )
-
-                for doc in docs:
-                    content = doc.page_content
-                    if "User:" in content:
-                        user_msg_parts = content.split("User:")
-                        for i, part in enumerate(user_msg_parts):
-                            if i == 0:  # Skip the first part before "User:"
-                                continue
-
-                            # Extract user message
-                            if "Assistant:" in part:
-                                user_text = part.split("Assistant:")[0].strip()
-                                assistant_text = part.split("Assistant:")[1].strip()
-                            else:
-                                user_text = part.strip()
-                                assistant_text = None
-
-                            if user_text:
-                                previous_messages.append(
-                                    HumanMessage(content=user_text)
-                                )
-
-                            if assistant_text:
-                                previous_messages.append(
-                                    AIMessage(content=assistant_text)
-                                )
-        except Exception as e:
-            previous_messages = []  # Reset if there's an error
-
     if is_new_conversation:
         new_conversation_id = str(uuid.uuid4())
         config = {"configurable": {"thread_id": new_conversation_id}}
 
-        # Initialize state with a single message
+        # Initialize state with just the current query
         state = {
             "conversation_id": new_conversation_id,
-            "messages": [HumanMessage(content=query)],
+            "messages": [],  # No message history for new conversations
             "query": query,
             "tool_decision": {
                 "use_rag": False,
@@ -439,7 +392,7 @@ async def generate_enhanced_response(query: str, conversation_id: Optional[str] 
             },
             "rag_context": "",
             "search_results": "",
-            "image_url": None,
+            "image_url": "",
             "response": "",
         }
 
@@ -448,11 +401,11 @@ async def generate_enhanced_response(query: str, conversation_id: Optional[str] 
     else:
         config = {"configurable": {"thread_id": conversation_id}}
 
-        # Add the current query to previous messages
-        messages = previous_messages.copy()
+        # Add the current query only
+        messages = []
         messages.append(HumanMessage(content=query))
 
-        # Initialize state with all messages
+        # Initialize state with messages
         state = {
             "conversation_id": conversation_id,
             "messages": messages,
@@ -464,7 +417,7 @@ async def generate_enhanced_response(query: str, conversation_id: Optional[str] 
             },
             "rag_context": "",
             "search_results": "",
-            "image_url": None,
+            "image_url": "",
             "response": "",
         }
 
@@ -524,14 +477,18 @@ async def generate_enhanced_response(query: str, conversation_id: Optional[str] 
         # Image generation results
         elif event_type == "on_node_end" and event.get("name") == "generate_image":
             image_url = event["data"]["output"].get("image_url")
-            if image_url:
+            if image_url and image_url != "":
                 safe_url = image_url.replace('"', '\\"').replace("'", "\\'")
                 yield f'data: {{"type":"image_generated","url":"{safe_url}"}}\n\n'
+                print(f"Debug: Image generated and URL saved: {image_url}")
 
         # Response completion notification
         elif event_type == "on_node_end" and event.get("name") == "generate_response":
             output_data = event["data"]["output"]
-            has_image = bool(output_data.get("image_url"))
+            has_image = (
+                bool(output_data.get("image_url"))
+                and output_data.get("image_url") != ""
+            )
 
             if has_image:
                 safe_url = (
