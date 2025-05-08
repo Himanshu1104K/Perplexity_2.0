@@ -78,12 +78,14 @@ const Home = () => {
         let url;
         if (conversationId) {
           // Use the continue endpoint when we have a conversation ID
-          url = `https://perplexity-2-0.onrender.com/rag_chat/continue/${encodeURIComponent(
+          // url = `https://perplexity-2-0.onrender.com/rag_chat/continue/${encodeURIComponent(
+          url = `http://localhost:8000/rag_chat/continue/${encodeURIComponent(
             conversationId
           )}/${encodeURIComponent(userInput)}`;
         } else {
           // Start a new conversation
-          url = `https://perplexity-2-0.onrender.com/rag_chat/${encodeURIComponent(
+          // url = `https://perplexity-2-0.onrender.com/rag_chat/${encodeURIComponent(
+          url = `http://localhost:8000/rag_chat/${encodeURIComponent(
             userInput
           )}`;
         }

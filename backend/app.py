@@ -19,7 +19,7 @@ from qdrant_client.models import Distance, VectorParams
 from dotenv import load_dotenv
 from langgraph.graph.message import add_messages
 from langgraph.types import Command
-
+import httpx
 import json
 from fastapi import FastAPI, Query
 from fastapi.responses import StreamingResponse
@@ -51,6 +51,11 @@ class EnhancedRAGState(TypedDict):
     rag_context: Annotated[str, get_last_value]
     search_results: Annotated[str, get_last_value]
     image_url: Annotated[str, get_last_value]
+    song_lyrics: Annotated[str, get_last_value]
+    song_audio_url: Annotated[str, get_last_value]
+    song_audio_data: Annotated[Dict, get_last_value]
+    video_url: Annotated[str, get_last_value]
+    video_data: Annotated[Dict, get_last_value]
     response: Annotated[str, get_last_value]
 
 
@@ -63,6 +68,8 @@ class ToolDecision(BaseModel):
         description="Whether to use web search for current information"
     )
     use_image_gen: bool = Field(description="Whether to generate an image")
+    use_song_gen: bool = Field(description="Whether to generate a song or lyrics")
+    use_video_gen: bool = Field(description="Whether to generate a video")
 
 
 # Initialize Qdrant client
@@ -135,8 +142,10 @@ async def select_tools(state: EnhancedRAGState) -> EnhancedRAGState:
            - IMPORTANT: ALWAYS use web search for queries about weather, news, sports scores, stock prices, or any real-time information
            - ALWAYS use web search when users ask about "today" or current conditions
         3. Image Generation: Use when the user explicitly asks for an image or visual content to be created
+        4. Song Generation: Use when the user explicitly asks for a song, lyrics, poem, or musical content to be created
+        5. Video Generation: Use when the user explicitly asks for a video, animation, or moving visual content to be created
         
-        Respond with a JSON object with these keys: "use_rag", "use_search", "use_image_gen" with boolean values.
+        Respond with a JSON object with these keys: "use_rag", "use_search", "use_image_gen", "use_song_gen", "use_video_gen" with boolean values.
         """,
             ),
             ("user", "{query}"),
@@ -155,6 +164,16 @@ async def select_tools(state: EnhancedRAGState) -> EnhancedRAGState:
     elif decision["use_image_gen"]:
         return Command(
             goto="generate_image",
+            update=state,
+        )
+    elif decision["use_song_gen"]:
+        return Command(
+            goto="generate_song",
+            update=state,
+        )
+    elif decision["use_video_gen"]:
+        return Command(
+            goto="generate_video",
             update=state,
         )
     elif decision["use_rag"]:
@@ -182,7 +201,7 @@ async def retrieve_from_rag(state: EnhancedRAGState) -> EnhancedRAGState:
         #         models.FieldCondition(
         #             key="conversation_id",
         #             match=models.MatchValue(value=state["conversation_id"]),
-        #         )
+        #         ),
         #     ]
         # ),
     )
@@ -212,9 +231,88 @@ def generate_dalle_image(prompt: str) -> str:
         return f"Error generating image: {str(e)}"
 
 
+# 4. Song Generation Tool
+@tool
+def generate_song_lyrics(prompt: str) -> str:
+    """Generate song lyrics based on a prompt"""
+    try:
+        client = OpenAI()
+        completion = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a skilled songwriter. Create original song lyrics based on the given prompt. Include title, verses, and chorus.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.7,
+            max_tokens=500,
+        )
+        return completion.choices[0].message.content
+    except Exception as e:
+        return f"Error generating song lyrics: {str(e)}"
+
+
+# 5. Video Generation Tool
+@tool
+def generate_video(prompt: str) -> Dict:
+    """Generate video based on a prompt"""
+    try:
+        client = OpenAI()
+        # This is a placeholder for actual video generation API
+        # In a real implementation, you would call a video generation service like Runway ML, Replicate, etc.
+        # For now, we'll simulate a response structure
+
+        # For example, if using the OpenAI API for a future video generation feature
+        # or using a third-party API through the OpenAI client
+
+        video_api_key = os.getenv("VIDEO_API_KEY")
+        video_api_url = os.getenv("VIDEO_API_URL")
+
+        if not video_api_key or not video_api_url:
+            return {
+                "status": "error",
+                "message": "Video API configuration is missing",
+                "url": None,
+            }
+
+        # Simulating a video generation request
+        # In a real implementation, you would make an HTTP request to the video generation API
+        # For example:
+        # async with httpx.AsyncClient() as client:
+        #     response = await client.post(
+        #         video_api_url,
+        #         headers={"Authorization": f"Bearer {video_api_key}"},
+        #         json={"prompt": prompt, "duration": 5}
+        #     )
+        #     result = response.json()
+
+        # For demonstration purposes, return a mock response
+        # In production, you would parse the actual API response
+        # Mock a progress ID that could be used to poll for status
+        progress_id = str(uuid.uuid4())
+
+        return {
+            "status": "processing",
+            "id": progress_id,
+            "message": "Video generation started",
+            "estimated_time": "30 seconds",
+            "url": f"https://example.com/video/{progress_id}",  # This would be a placeholder until processing completes
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Error generating video: {str(e)}",
+            "url": None,
+        }
+
+
 # Initialize tools
 tavily_tool = TavilySearchResults(max_results=3)
 dalle_tool = generate_dalle_image
+song_tool = generate_song_lyrics
+video_tool = generate_video
 
 
 # Web Search Node
@@ -277,6 +375,157 @@ async def generate_image(state: EnhancedRAGState) -> EnhancedRAGState:
     )
 
 
+# Song Generation Node
+async def generate_song(state: EnhancedRAGState) -> EnhancedRAGState:
+    """Generate song lyrics and audio if needed"""
+    # Create an improved prompt for song generation
+    song_prompt_template = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                """
+        Create a detailed and clear prompt for generating song lyrics based on 
+        the user's request. Focus on theme, mood, style, and any specific requirements.
+        Keep it concise but descriptive.
+        """,
+            ),
+            ("user", "{query}"),
+        ]
+    )
+
+    chain = song_prompt_template | llm | StrOutputParser()
+    enhanced_prompt = await chain.ainvoke({"query": state["query"]})
+
+    # Execute the song generation tool for lyrics
+    song_lyrics = await song_tool.ainvoke(enhanced_prompt)
+    state["song_lyrics"] = str(song_lyrics)
+
+    # Generate audio using the Suno API
+    try:
+        suno_url = os.getenv("SUNO_URL")
+        suno_api_key = os.getenv("SUNO_API_KEY")
+
+        # Check if environment variables are set
+        if not suno_url or not suno_api_key:
+            print("Warning: SUNO_URL or SUNO_API_KEY environment variables not set")
+            state["song_audio_url"] = ""
+            state["song_audio_data"] = {"error": "Missing Suno API configuration"}
+            return Command(goto="generate_response", update=state)
+
+        payload = {
+            "model": "minimax-music",
+            "prompt": song_lyrics,
+        }
+
+        headers = {
+            "Authorization": f"Bearer {suno_api_key}",
+            "Content-Type": "application/json",
+        }
+
+        # Make request to Suno API
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            try:
+                response = await client.post(suno_url, json=payload, headers=headers)
+
+                # Check if the request was successful
+                if response.status_code == 200 or response.status_code == 201:
+                    song_data = response.json()
+                    print(f"Suno API response: {song_data}")
+
+                    # Store the full response data for future reference
+                    state["song_audio_data"] = song_data
+
+                    # Extract the audio URL from the response (adjust based on actual Suno API response format)
+                    if "audio_url" in song_data:
+                        state["song_audio_url"] = song_data["audio_url"]
+                    elif "url" in song_data:
+                        state["song_audio_url"] = song_data["url"]
+                    elif "id" in song_data:
+                        # Some APIs return an ID first and then require a separate call to get the URL
+                        # Try to handle both direct URL and ID-based reference
+                        state["song_audio_url"] = f"{suno_url}/audio/{song_data['id']}"
+
+                        # If the API returns a status indicating the song is being processed
+                        # we could implement polling logic here, but for simplicity, we'll just
+                        # pass the ID and let the frontend handle polling if needed
+                        if "status" in song_data and song_data["status"] in [
+                            "processing",
+                            "pending",
+                        ]:
+                            print(
+                                f"Song generation in progress with ID: {song_data['id']}"
+                            )
+                    else:
+                        # Fallback: store a serialized version of the response
+                        print(f"Unrecognized Suno API response format: {song_data}")
+                        state["song_audio_url"] = f"suno:data:{json.dumps(song_data)}"
+                else:
+                    error_message = (
+                        f"Suno API error: {response.status_code} - {response.text}"
+                    )
+                    print(error_message)
+                    state["song_audio_url"] = ""
+                    state["song_audio_data"] = {
+                        "error": error_message,
+                        "status_code": response.status_code,
+                    }
+            except httpx.TimeoutException:
+                error_message = "Suno API request timed out"
+                print(error_message)
+                state["song_audio_url"] = ""
+                state["song_audio_data"] = {"error": error_message, "status": "timeout"}
+    except Exception as e:
+        error_message = f"Error generating song audio: {str(e)}"
+        print(error_message)
+        state["song_audio_url"] = ""
+        state["song_audio_data"] = {"error": error_message}
+
+    return Command(
+        goto="generate_response",
+        update=state,
+    )
+
+
+# Video Generation Node
+async def generate_video(state: EnhancedRAGState) -> EnhancedRAGState:
+    """Generate a video if needed"""
+    # Create an improved prompt for video generation
+    video_prompt_template = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                """
+        Create a detailed and clear prompt for generating a video based on 
+        the user's request. Focus on scene description, camera movement, style, and any specific visual elements.
+        Include details about setting, characters or objects, actions, and atmosphere.
+        Keep it concise (under 200 words) but descriptive.
+        """,
+            ),
+            ("user", "{query}"),
+        ]
+    )
+
+    chain = video_prompt_template | llm | StrOutputParser()
+    enhanced_prompt = await chain.ainvoke({"query": state["query"]})
+
+    # Execute the video generation tool
+    video_result = await video_tool.ainvoke(enhanced_prompt)
+
+    # Store the video data
+    state["video_data"] = video_result
+
+    # Extract URL if available
+    if isinstance(video_result, dict) and "url" in video_result:
+        state["video_url"] = video_result["url"]
+    else:
+        state["video_url"] = ""
+
+    return Command(
+        goto="generate_response",
+        update=state,
+    )
+
+
 # Response Generation Node
 async def generate_response(state: EnhancedRAGState) -> EnhancedRAGState:
     """Generate response based on all available information"""
@@ -286,7 +535,9 @@ async def generate_response(state: EnhancedRAGState) -> EnhancedRAGState:
             "system",
             "You are a helpful AI assistant. Respond directly to the user's query in a clear and concise manner. "
             "If you have search results, use them to inform your response but don't mention the search process itself. "
-            "If an image was generated, simply describe what's in the image and mention it's available for viewing.",
+            "If an image was generated, simply describe what's in the image and mention it's available for viewing. "
+            "If a song was generated, mention that a song has been created for the user and is available for listening. "
+            "If a video was generated, mention that a video has been created and is available for viewing.",
         )
     ]
 
@@ -309,6 +560,54 @@ async def generate_response(state: EnhancedRAGState) -> EnhancedRAGState:
             )
         )
 
+    if state["song_audio_url"] and state["song_audio_url"] != "":
+        messages.append(
+            (
+                "system",
+                "You have generated a song which is available at: "
+                + state["song_audio_url"]
+                + ". Mention that a song has been created for the user and DO include the URL in your response. "
+                + "Tell them they can listen to it by clicking the link or using the audio player in the interface.",
+            )
+        )
+    elif state["song_lyrics"] and state["song_lyrics"] != "":
+        # We generated lyrics but no audio URL yet
+        messages.append(
+            (
+                "system",
+                "You have generated song lyrics but the audio is still being processed. "
+                "Tell the user that a song is being generated and will be available shortly. "
+                "Do not include the raw lyrics in your response.",
+            )
+        )
+
+    if state["video_url"] and state["video_url"] != "":
+        video_status = (
+            state["video_data"].get("status", "ready")
+            if isinstance(state["video_data"], dict)
+            else "ready"
+        )
+
+        if video_status.lower() in ["processing", "pending"]:
+            messages.append(
+                (
+                    "system",
+                    "You have started generating a video based on the user's request. "
+                    "Tell the user that their video is being processed and will be available shortly. "
+                    "You can mention that video generation can take a minute or two to complete.",
+                )
+            )
+        else:
+            messages.append(
+                (
+                    "system",
+                    "You have generated a video which is available at: "
+                    + state["video_url"]
+                    + ". Mention that a video has been created for the user and DO include the URL in your response. "
+                    + "Tell them they can watch it by clicking the link or using the video player in the interface.",
+                )
+            )
+
     # Add only the current query - don't include message history to avoid confusion
     messages.append(("user", state["query"]))
 
@@ -329,6 +628,8 @@ def build_enhanced_graph():
     workflow.add_node("retrieve_from_rag", retrieve_from_rag)
     workflow.add_node("perform_web_search", perform_web_search)
     workflow.add_node("generate_image", generate_image)
+    workflow.add_node("generate_song", generate_song)
+    workflow.add_node("generate_video", generate_video)
     workflow.add_node("generate_response", generate_response)
 
     workflow.add_edge("generate_response", END)
@@ -389,10 +690,17 @@ async def generate_enhanced_response(query: str, conversation_id: Optional[str] 
                 "use_rag": False,
                 "use_search": False,
                 "use_image_gen": False,
+                "use_song_gen": False,
+                "use_video_gen": False,
             },
             "rag_context": "",
             "search_results": "",
             "image_url": "",
+            "song_lyrics": "",
+            "song_audio_url": "",
+            "song_audio_data": {},
+            "video_url": "",
+            "video_data": {},
             "response": "",
         }
 
@@ -414,10 +722,17 @@ async def generate_enhanced_response(query: str, conversation_id: Optional[str] 
                 "use_rag": False,
                 "use_search": False,
                 "use_image_gen": False,
+                "use_song_gen": False,
+                "use_video_gen": False,
             },
             "rag_context": "",
             "search_results": "",
             "image_url": "",
+            "song_lyrics": "",
+            "song_audio_url": "",
+            "song_audio_data": {},
+            "video_url": "",
+            "video_data": {},
             "response": "",
         }
 
@@ -461,6 +776,22 @@ async def generate_enhanced_response(query: str, conversation_id: Optional[str] 
                     )
                     yield f'data: {{"type":"image_gen_start","query":"{safe_query}"}}\n\n'
 
+                if tool_decision.get("use_song_gen", False):
+                    safe_query = (
+                        query.replace('"', '\\"')
+                        .replace("'", "\\'")
+                        .replace("\n", "\\n")
+                    )
+                    yield f'data: {{"type":"song_gen_start","query":"{safe_query}"}}\n\n'
+
+                if tool_decision.get("use_video_gen", False):
+                    safe_query = (
+                        query.replace('"', '\\"')
+                        .replace("'", "\\'")
+                        .replace("\n", "\\n")
+                    )
+                    yield f'data: {{"type":"video_gen_start","query":"{safe_query}"}}\n\n'
+
         # Web search results
         elif event_type == "on_node_end" and event.get("name") == "perform_web_search":
             search_results = event["data"]["output"].get("search_results", "")
@@ -482,6 +813,82 @@ async def generate_enhanced_response(query: str, conversation_id: Optional[str] 
                 yield f'data: {{"type":"image_generated","url":"{safe_url}"}}\n\n'
                 print(f"Debug: Image generated and URL saved: {image_url}")
 
+        # Song generation results
+        elif event_type == "on_node_end" and event.get("name") == "generate_song":
+            song_audio_url = event["data"]["output"].get("song_audio_url", "")
+            song_audio_data = event["data"]["output"].get("song_audio_data", {})
+
+            if song_audio_url and song_audio_url != "":
+                # Create a response object with just the audio URL
+                song_response = {
+                    "type": "song_generated",
+                    "audio_url": song_audio_url,
+                }
+
+                # Include essential audio data if available
+                if song_audio_data:
+                    # Include only necessary fields to avoid overwhelming the response
+                    if isinstance(song_audio_data, dict):
+                        filtered_data = {}
+                        for key in ["id", "status", "progress", "created_at", "url"]:
+                            if key in song_audio_data:
+                                filtered_data[key] = song_audio_data[key]
+
+                        # Some APIs might nest data, try to extract it
+                        if "data" in song_audio_data and isinstance(
+                            song_audio_data["data"], dict
+                        ):
+                            for key in ["id", "status", "progress", "url", "audio_url"]:
+                                if key in song_audio_data["data"]:
+                                    filtered_data[key] = song_audio_data["data"][key]
+
+                        song_response["audio_data"] = filtered_data
+
+                # Convert to JSON string and send to client
+                song_response_json = json.dumps(song_response)
+                yield f"data: {song_response_json}\n\n"
+                print("Debug: Song audio URL sent to frontend")
+
+        # Video generation results
+        elif event_type == "on_node_end" and event.get("name") == "generate_video":
+            video_url = event["data"]["output"].get("video_url", "")
+            video_data = event["data"]["output"].get("video_data", {})
+
+            # Prepare response with video information
+            video_response = {
+                "type": "video_generated",
+            }
+
+            if video_url and video_url != "":
+                video_response["video_url"] = video_url
+
+            if video_data:
+                # Include relevant video metadata
+                if isinstance(video_data, dict):
+                    filtered_data = {}
+                    # Extract important fields
+                    for key in ["id", "status", "progress", "estimated_time"]:
+                        if key in video_data:
+                            filtered_data[key] = video_data[key]
+
+                    video_response["video_data"] = filtered_data
+
+                    # If video is still processing, include that information
+                    if video_data.get("status", "").lower() in [
+                        "processing",
+                        "pending",
+                    ]:
+                        video_response["status"] = "processing"
+                        if "estimated_time" in video_data:
+                            video_response["estimated_time"] = video_data[
+                                "estimated_time"
+                            ]
+
+            # Send video information to the client
+            video_response_json = json.dumps(video_response)
+            yield f"data: {video_response_json}\n\n"
+            print(f"Debug: Video generation info sent to frontend: {video_response}")
+
         # Response completion notification
         elif event_type == "on_node_end" and event.get("name") == "generate_response":
             output_data = event["data"]["output"]
@@ -489,14 +896,68 @@ async def generate_enhanced_response(query: str, conversation_id: Optional[str] 
                 bool(output_data.get("image_url"))
                 and output_data.get("image_url") != ""
             )
+            has_song_audio = (
+                bool(output_data.get("song_audio_url"))
+                and output_data.get("song_audio_url") != ""
+            )
+            has_video = (
+                bool(output_data.get("video_url"))
+                and output_data.get("video_url") != ""
+            )
+
+            response_data = {
+                "type": "response_complete",
+                "has_image": False,
+                "has_song_audio": False,
+                "has_video": False,
+            }
 
             if has_image:
-                safe_url = (
-                    output_data["image_url"].replace('"', '\\"').replace("'", "\\'")
-                )
-                yield f'data: {{"type":"response_complete","has_image":true,"image_url":"{safe_url}"}}\n\n'
-            else:
-                yield f'data: {{"type":"response_complete","has_image":false}}\n\n'
+                response_data["has_image"] = True
+                response_data["image_url"] = output_data["image_url"]
+
+            if has_song_audio:
+                response_data["has_song_audio"] = True
+                response_data["song_audio_url"] = output_data["song_audio_url"]
+
+                # Include selected audio data fields if available
+                if "song_audio_data" in output_data and output_data["song_audio_data"]:
+                    audio_data = output_data["song_audio_data"]
+                    if isinstance(audio_data, dict):
+                        # Only include essential fields to keep the response size manageable
+                        essential_fields = {}
+                        for key in ["id", "status", "progress", "url"]:
+                            if key in audio_data:
+                                essential_fields[key] = audio_data[key]
+
+                        # Check if audio data is nested within a data field
+                        if "data" in audio_data and isinstance(
+                            audio_data["data"], dict
+                        ):
+                            for key in ["id", "status", "progress", "url", "audio_url"]:
+                                if key in audio_data["data"]:
+                                    essential_fields[key] = audio_data["data"][key]
+
+                        response_data["song_audio_data"] = essential_fields
+
+            if has_video:
+                response_data["has_video"] = True
+                response_data["video_url"] = output_data["video_url"]
+
+                # Include video processing status info
+                if "video_data" in output_data and output_data["video_data"]:
+                    video_data = output_data["video_data"]
+                    if isinstance(video_data, dict):
+                        # Extract key video information
+                        video_info = {}
+                        for key in ["id", "status", "progress", "estimated_time"]:
+                            if key in video_data:
+                                video_info[key] = video_data[key]
+
+                        response_data["video_data"] = video_info
+
+            response_json = json.dumps(response_data)
+            yield f"data: {response_json}\n\n"
 
     # Store conversation
     await store_conversation(
