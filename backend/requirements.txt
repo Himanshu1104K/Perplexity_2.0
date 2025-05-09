@@ -9,3 +9,6 @@ langchain_openai
 openai
 qdrant-client
 langchain_qdrant
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
